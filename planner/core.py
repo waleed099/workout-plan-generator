@@ -19,6 +19,7 @@ from .models import (
     WorkoutPlan,
 )
 from .prompts import (
+    PLAN_JSON_SCHEMA,
     SWAP_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     build_repair_prompt,
@@ -28,6 +29,10 @@ from .prompts import (
 
 # llama-3.3-70b-versatile was retired by Groq in Aug 2026; gpt-oss-120b is the recommended replacement.
 DEFAULT_MODEL = "openai/gpt-oss-120b"
+# Groq counts prompt + max_completion_tokens against tokens-per-minute up front, and the free tier
+# allows 8000 TPM, so a larger request is rejected with HTTP 413 before the model even runs.
+MAX_REQUEST_TOKENS = 7500
+MIN_COMPLETION_TOKENS = 2000
 MIN_DAYS, MAX_DAYS = 1, 7
 MIN_MINUTES, MAX_MINUTES = 15, 180
 
@@ -81,7 +86,7 @@ def validate_inputs(
         raise InputValidationError("Please choose how many days per week you can train.")
     try:
         days = int(days_per_week)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise InputValidationError("Days per week must be a whole number.") from exc
     if days != days_per_week or not MIN_DAYS <= days <= MAX_DAYS:
         raise InputValidationError(
@@ -97,7 +102,7 @@ def validate_inputs(
 
     try:
         minutes = int(session_minutes if session_minutes is not None else 45)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise InputValidationError("Session length must be a number of minutes.") from exc
     if not MIN_MINUTES <= minutes <= MAX_MINUTES:
         raise InputValidationError(
@@ -144,8 +149,8 @@ def _s(value: Any) -> str:
 def _str_list(value: Any) -> list[str]:
     if value is None:
         return []
-    if isinstance(value, str):
-        return [value.strip()] if value.strip() else []
+    if not isinstance(value, (list, tuple)):
+        return [_s(value)] if _s(value) else []
     return [_s(v) for v in value if _s(v)]
 
 
@@ -171,7 +176,10 @@ def parse_plan(data: dict[str, Any]) -> WorkoutPlan:
     for raw in raw_days:
         if not isinstance(raw, dict):
             continue
-        exercises = [ex for ex in map(parse_exercise, raw.get("exercises") or []) if ex]
+        raw_exercises = raw.get("exercises")
+        if not isinstance(raw_exercises, list):
+            continue
+        exercises = [ex for ex in map(parse_exercise, raw_exercises) if ex]
         if not exercises:
             continue
         days.append(
@@ -203,8 +211,9 @@ _GYM_ONLY = [
     r"barbell", r"\bcable", r"machine", r"smith", r"lat pull-?down", r"leg press",
     r"leg extension", r"leg curl machine", r"pec deck", r"\bsled\b", r"trap bar", r"ez[- ]bar",
     r"t-bar", r"hack squat", r"kettlebell", r"\bband(ed)?\b", r"resistance band",
-    r"pull-?ups?\b", r"chin-?ups?\b", r"treadmill", r"rowing machine", r"\berg\b",
-    r"bench press", r"incline bench", r"\bon (a|the) bench\b",
+    r"pull-?ups?\b", r"chin-?ups?\b", r"treadmill", r"\brower\b", r"\berg\b", r"\bbike\b",
+    r"\bbench\b", r"ab wheel", r"\btrx\b", r"suspension", r"medicine ball",
+    r"(jump|skipping) rope",
 ]
 _DUMBBELL = [r"dumbbells?", r"\bdb\b"]
 
@@ -251,7 +260,7 @@ def _friendly_api_error(exc: Exception) -> PlanGenerationError:
         msg = "Your Groq API key was rejected. Check that it is correct and still active."
     elif name == "PermissionDeniedError":
         msg = "This Groq API key doesn't have access to the selected model."
-    elif name == "RateLimitError":
+    elif name == "RateLimitError" or getattr(exc, "status_code", 0) == 413 or "tokens per minute" in text:
         msg = "Groq's rate limit was hit. Wait a minute and try again."
     elif name in ("APIConnectionError", "APITimeoutError", "ConnectionError", "TimeoutError"):
         msg = "Couldn't reach Groq. Check your internet connection and try again."
@@ -283,17 +292,24 @@ def _chat(
     messages: list[dict[str, str]],
     temperature: float,
     max_tokens: int = 8000,
+    schema: dict[str, Any] | None = None,
 ) -> str:
     """Single chat-completion call returning the message text (may be empty)."""
+    prompt_tokens = sum(len(m["content"]) for m in messages) // 4  # rough estimate
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "max_completion_tokens": max_tokens,
+        "max_completion_tokens": min(max_tokens, max(MIN_COMPLETION_TOKENS, MAX_REQUEST_TOKENS - prompt_tokens)),
         "response_format": {"type": "json_object"},
     }
     if model.startswith("openai/gpt-oss"):
         kwargs["reasoning_effort"] = "medium"
+        if schema:  # Groq's strict structured outputs only cover the gpt-oss models
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "workout_plan", "strict": True, "schema": schema},
+            }
     response = client.chat.completions.create(**kwargs)
     choices = getattr(response, "choices", None) or []
     if not choices:
@@ -323,12 +339,14 @@ def request_plan(
 
     for attempt in range(1, max_attempts + 1):
         try:
-            content = _chat(client, model, messages, temperature)
+            content = _chat(client, model, messages, temperature, schema=PLAN_JSON_SCHEMA)
         except PlanGenerationError:
             raise
         except Exception as exc:  # noqa: BLE001 - every API failure becomes a friendly message
             if _is_json_mode_failure(exc) and attempt < max_attempts:
                 continue
+            if best is not None:  # a flawed plan with warnings beats losing it to a failed repair
+                break
             raise _friendly_api_error(exc) from exc
 
         try:
@@ -407,6 +425,8 @@ def swap_exercise(
         raise InputValidationError("Please pick an exercise to swap.") from exc
 
     others = [e.name for i, e in enumerate(day.exercises) if i != exercise_index]
+    taken = {name.lower() for name in [current.name, *others]}
+    patterns = forbidden_patterns(profile.equipment)
     messages = [
         {"role": "system", "content": SWAP_SYSTEM_PROMPT},
         {"role": "user", "content": build_swap_prompt(profile, day.focus, current.name, others, reason)},
@@ -414,20 +434,22 @@ def swap_exercise(
     try:
         llm = client or make_client(api_key)
         for _ in range(2):
-            new = parse_exercise(extract_json(_chat(llm, model, messages, 0.8, max_tokens=2000)))
-            patterns = forbidden_patterns(profile.equipment)
-            if new and new.name.lower() != current.name.lower() and not any(
+            content = _chat(llm, model, messages, 0.8, max_tokens=2000)
+            try:
+                new = parse_exercise(extract_json(content))
+            except ValueError:  # includes json.JSONDecodeError
+                new = None
+            if new and new.name.lower() not in taken and not any(
                 re.search(p, new.name, re.IGNORECASE) for p in patterns
             ):
                 return new
             messages.append({
                 "role": "user",
-                "content": "That suggestion is invalid (same exercise or not allowed with this equipment). Try a different one.",
+                "content": "That suggestion is invalid (unreadable, already in the session, or not "
+                "allowed with this equipment). Try a different one.",
             })
     except PlanGenerationError:
         raise
-    except (ValueError, json.JSONDecodeError):
-        pass
     except Exception as exc:  # noqa: BLE001
         raise _friendly_api_error(exc) from exc
     raise PlanGenerationError("Couldn't find a suitable swap this time. Please try again.")

@@ -25,7 +25,7 @@ from planner import (
     validate_inputs,
 )
 
-MODEL_OPTIONS = ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"]
+MODEL_OPTIONS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
 st.set_page_config(page_title="Workout Plan Generator", page_icon="🏋️", layout="wide")
 
@@ -74,6 +74,7 @@ def run_generation(inputs: dict, api_key: str, model: str, temperature: float) -
     st.session_state.plan = result.plan
     st.session_state.profile = profile
     st.session_state.warnings = result.warnings
+    st.session_state.variation += 1
     st.session_state.swap_msg = None
 
 
@@ -129,14 +130,17 @@ def render_plan(plan: WorkoutPlan, profile: UserProfile) -> None:
 
 def render_swap(plan: WorkoutPlan, profile: UserProfile, api_key: str, model: str) -> None:
     with st.expander("🔁 Swap an exercise"):
+        # Keys are per plan and per day so a stale index can't outlive the list it pointed into.
+        variation = st.session_state.variation
         day_idx = st.selectbox(
             "Day", range(len(plan.days)),
             format_func=lambda i: f"Day {plan.days[i].day}: {plan.days[i].focus}",
-            key="swap_day",
+            key=f"swap_day_{variation}",
         )
         exercises = plan.days[day_idx].exercises
         ex_idx = st.selectbox(
-            "Exercise", range(len(exercises)), format_func=lambda i: exercises[i].name, key="swap_ex"
+            "Exercise", range(len(exercises)), format_func=lambda i: exercises[i].name,
+            key=f"swap_ex_{variation}_{day_idx}",
         )
         reason = st.text_input("Why? (optional)", placeholder="e.g. too hard, don't like it, hurts my wrist")
         if st.button("Swap it"):
